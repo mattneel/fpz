@@ -116,10 +116,17 @@ pub fn build(b: *std.Build) void {
     }
 
     // Creates an executable that will run `test` blocks from the provided module.
-    // Here `mod` needs to define a target, which is why earlier we made sure to
-    // set the releative field.
+    // The library `mod` deliberately doesn't bake in an optimize level (so
+    // downstream consumers pick their own). For the test runner, however, we
+    // want -Doptimize=… to actually take effect — the determinism corollary
+    // (SPEC §2) requires us to verify bit-identical results across Debug,
+    // ReleaseSafe, and ReleaseFast. Build a parallel module that honors it.
     const mod_tests = b.addTest(.{
-        .root_module = mod,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
     });
 
     // A run step that will run the test executable.
@@ -141,6 +148,73 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+
+    // ----------------------------------------------------------------------
+    // Conformance generator (SPEC §8). Run via `zig build gen-conformance`
+    // to rebaseline src/conformance.zig. The generator runs at ReleaseFast
+    // for speed but the determinism contract guarantees identical output to
+    // Debug / ReleaseSafe — re-running under any mode yields the same file.
+    // ----------------------------------------------------------------------
+    const gen_exe = b.addExecutable(.{
+        .name = "gen-conformance",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/gen_conformance.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "fpz", .module = mod },
+            },
+        }),
+    });
+    const gen_run = b.addRunArtifact(gen_exe);
+    const gen_step = b.step(
+        "gen-conformance",
+        "Regenerate src/conformance.zig from current implementation output",
+    );
+    gen_step.dependOn(&gen_run.step);
+
+    // ----------------------------------------------------------------------
+    // Cross-mode test step (SPEC §2 corollary). Runs the test suite under
+    // each optimize mode to verify identical bit output across modes.
+    // ----------------------------------------------------------------------
+    const test_all_step = b.step("test-all-modes", "Run tests under Debug, ReleaseSafe, and ReleaseFast");
+    for ([_]std.builtin.OptimizeMode{ .Debug, .ReleaseSafe, .ReleaseFast }) |mode| {
+        const m_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/root.zig"),
+                .target = target,
+                .optimize = mode,
+            }),
+        });
+        const m_run = b.addRunArtifact(m_tests);
+        test_all_step.dependOn(&m_run.step);
+    }
+
+    // ----------------------------------------------------------------------
+    // Cross-target compile check. Verifies the library compiles cleanly on
+    // multiple architectures — a local proxy for SPEC §8's "every target
+    // arch" CI claim. Doesn't run the tests (no QEMU here); CI runs them.
+    // ----------------------------------------------------------------------
+    const cross_step = b.step("test-cross-build", "Cross-compile tests for several architectures (build-only)");
+    const cross_targets = [_]std.Target.Query{
+        .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu },
+        .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .gnu },
+        .{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu },
+        .{ .cpu_arch = .aarch64, .os_tag = .macos },
+        .{ .cpu_arch = .wasm32, .os_tag = .wasi },
+    };
+    for (cross_targets) |query| {
+        const t = b.resolveTargetQuery(query);
+        const cross_test = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/root.zig"),
+                .target = t,
+                .optimize = .ReleaseFast,
+            }),
+        });
+        // Depend on the compile step only — we're not running anything.
+        cross_step.dependOn(&cross_test.step);
+    }
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
