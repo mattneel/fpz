@@ -38,4 +38,5 @@ test {
     _ = sqrt_mod;
     _ = trig_mod;
     _ = transcendental_mod;
+    _ = @import("conformance_test.zig");
 }
